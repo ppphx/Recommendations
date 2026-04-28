@@ -1,1 +1,292 @@
+import pandas as pd
+import numpy as np
+from scipy.sparse import csr_matrix
+import warnings
+warnings.filterwarnings('ignore')
 
+# 1. ЗАГРУЗКА И ПОДГОТОВКА ДАННЫХ
+
+def load_and_prepare_data(filepath='steam_reco_interactions_clean.csv'):
+    print("Загрузка данных...")
+    try:
+        df = pd.read_csv(filepath)
+    except Exception as e:
+        print(f"Ошибка загрузки файла: {e}")
+        return None
+
+    # Используем y_recommended как рейтинг (0 или 1)
+    if 'y_recommended' not in df.columns:
+        raise ValueError("Колонка y_recommended не найдена")
+        
+    # Агрегация: среднее значение рекомендации для пары user-item
+    df_agg = df.groupby(['user_id', 'game_id'])['y_recommended'].mean().reset_index()
+    
+    # Маппинг ID в индексы
+    users = df_agg['user_id'].unique()
+    items = df_agg['game_id'].unique()
+    
+    user2idx = {u: i for i, u in enumerate(users)}
+    item2idx = {it: i for i, it in enumerate(items)}
+    idx2item = {i: it for it, i in item2idx.items()}
+    idx2user = {i: u for u, i in user2idx.items()}
+    
+    df_agg['u_idx'] = df_agg['user_id'].map(user2idx)
+    df_agg['i_idx'] = df_agg['game_id'].map(item2idx)
+    
+    n_users = len(users)
+    n_items = len(items)
+    
+    # Сохраняем названия игр для вывода
+    if 'game_name' in df.columns:
+        # Берем первое встретившееся название для каждого game_id
+        game_names = df.drop_duplicates(subset=['game_id'])[['game_id', 'game_name']].set_index('game_id')['game_name'].to_dict()
+    else:
+        game_names = {}
+
+    return df_agg, user2idx, item2idx, idx2item, idx2user, game_names, n_users, n_items
+
+# 2. РЕАЛИЗАЦИЯ SVD (FunkSVD)
+
+class SVDRecommender:
+    def __init__(self, n_factors=50, n_epochs=20, lr=0.005, reg=0.02):
+        self.n_factors = n_factors
+        self.n_epochs = n_epochs
+        self.lr = lr
+        self.reg = reg
+        
+        self.user_biases = None
+        self.item_biases = None
+        self.global_mean = None
+        self.user_factors = None
+        self.item_factors = None
+        
+    def fit(self, train_df, user_col='u_idx', item_col='i_idx', rating_col='y_recommended'):
+        print(f"Начало обучения SVD (factors={self.n_factors})")
+        
+        n_users = train_df[user_col].max() + 1
+        n_items = train_df[item_col].max() + 1
+        
+        np.random.seed(42)
+        self.user_factors = np.random.normal(0, 0.1, (n_users, self.n_factors))
+        self.item_factors = np.random.normal(0, 0.1, (n_items, self.n_factors))
+        
+        self.user_biases = np.zeros(n_users)
+        self.item_biases = np.zeros(n_items)
+        self.global_mean = train_df[rating_col].mean()
+        
+        data = train_df[[user_col, item_col, rating_col]].values
+        
+        for epoch in range(self.n_epochs):
+            np.random.shuffle(data)
+            total_error = 0
+            count = 0
+            
+            for u_idx, i_idx, r_ui in data:
+                u_idx = int(u_idx)
+                i_idx = int(i_idx)
+                
+                pred = self.global_mean + self.user_biases[u_idx] + self.item_biases[i_idx] + \
+                       np.dot(self.user_factors[u_idx], self.item_factors[i_idx])
+                
+                err = r_ui - pred
+                total_error += err**2
+                count += 1
+                
+                self.user_biases[u_idx] += self.lr * (err - self.reg * self.user_biases[u_idx])
+                self.item_biases[i_idx] += self.lr * (err - self.reg * self.item_biases[i_idx])
+                
+                u_vec_old = self.user_factors[u_idx].copy()
+                self.user_factors[u_idx] += self.lr * (err * self.item_factors[i_idx] - self.reg * self.user_factors[u_idx])
+                self.item_factors[i_idx] += self.lr * (err * u_vec_old - self.reg * self.item_factors[i_idx])
+            
+            rmse = np.sqrt(total_error / count)
+            if (epoch + 1) % 5 == 0:
+                print(f"  Epoch {epoch+1}/{self.n_epochs}, Train RMSE: {rmse:.4f}")
+                
+        print("Обучение завершено.")
+
+    def predict(self, user_idx, item_idx):
+        pred = self.global_mean + self.user_biases[user_idx] + self.item_biases[item_idx] + \
+               np.dot(self.user_factors[user_idx], self.item_factors[item_idx])
+        return pred
+
+# 3. РАСЧЕТ МЕТРИК (Ranking & Rating)
+
+def calculate_all_metrics(model, test_df, train_df, user2idx, item2idx, idx2item, top_k=10):
+    """
+    Рассчитывает RMSE, MAE, Precision@K, Recall@K, HitRate@K, NDCG@K
+    """
+    print(f"\nРасчет метрик на тестовой выборке (Top-{top_k})")
+    
+    # Группируем тестовые данные по пользователям
+    test_grouped = test_df.groupby('user_id')['game_id'].apply(set).to_dict()
+    
+    all_item_indices = list(item2idx.values())
+    
+    precisions = []
+    recalls = []
+    hit_rates = []
+    ndcgs = []
+    
+    rmse_errors = []
+    mae_errors = []
+    
+    users_evaluated = 0
+
+    for user_id, true_game_ids in test_grouped.items():
+        if user_id not in user2idx:
+            continue
+            
+        u_idx = user2idx[user_id]
+        
+        # 1. Получаем список игр, которые пользователь уже видел в Train
+        seen_in_train = set(train_df[train_df['user_id'] == user_id]['game_id'].values)
+        
+        # 2. Генерируем кандидатов
+        candidates = []
+        for i_idx in all_item_indices:
+            game_id = idx2item[i_idx]
+            if game_id not in seen_in_train:
+                pred_score = model.predict(u_idx, i_idx)
+                candidates.append((game_id, pred_score))
+        
+        if not candidates:
+            continue
+            
+        # 3. Сортируем и берем Top-K
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top_k_recs = candidates[:top_k]
+        top_k_game_ids = [item[0] for item in top_k_recs]
+        
+        # 4. Расчет Ranking Metrics
+        true_set = true_game_ids
+        hits = len(set(top_k_game_ids) & true_set)
+        
+        precisions.append(hits / top_k)
+        recalls.append(hits / len(true_set) if len(true_set) > 0 else 0)
+        hit_rates.append(1 if hits > 0 else 0)
+        
+        # NDCG@K
+        dcg = 0.0
+        for rank, game_id in enumerate(top_k_game_ids):
+            if game_id in true_set:
+                dcg += 1.0 / np.log2(rank + 2)
+        
+        n_rel = min(len(true_set), top_k)
+        idcg = sum(1.0 / np.log2(i + 2) for i in range(n_rel))
+        ndcg = dcg / idcg if idcg > 0 else 0
+        ndcgs.append(ndcg)
+        
+        # 5. Расчет Rating Metrics (RMSE, MAE)
+        user_test_data = test_df[test_df['user_id'] == user_id]
+        for _, row in user_test_data.iterrows():
+            g_id = row['game_id']
+            true_r = row['y_recommended']
+            if g_id in item2idx:
+                i_idx = item2idx[g_id]
+                pred_r = model.predict(u_idx, i_idx)
+                pred_r_clipped = np.clip(pred_r, 0, 1)
+                rmse_errors.append((true_r - pred_r_clipped) ** 2)
+                mae_errors.append(abs(true_r - pred_r_clipped))
+        
+        users_evaluated += 1
+
+    if users_evaluated == 0:
+        return {}
+
+    metrics = {
+        'RMSE': np.sqrt(np.mean(rmse_errors)) if rmse_errors else 0,
+        'MAE': np.mean(mae_errors) if mae_errors else 0,
+        'Precision@K': np.mean(precisions),
+        'Recall@K': np.mean(recalls),
+        'HitRate@K': np.mean(hit_rates),
+        'NDCG@K': np.mean(ndcgs)
+    }
+    
+    return metrics
+
+# 4. ГЛАВНЫЙ СКРИПТ С ПОДБОРОМ ГИПЕРПАРАМЕТРОВ
+
+def main():
+    # 1. Загрузка
+    data = load_and_prepare_data('steam_reco_interactions_clean.csv')
+    if data is None: return
+    
+    df, user2idx, item2idx, idx2item, idx2user, game_names, n_users, n_items = data
+    
+    # 2. Разбиение на Train/Test
+    from sklearn.model_selection import train_test_split
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+    
+    print(f"Train size: {len(train_df)}, Test size: {len(test_df)}")
+    
+    # 3. Эксперимент с гиперпараметрами (n_factors)
+    factors_list = [10, 30, 50, 100]
+    all_results = []
+    
+    print()
+    print("ЗАПУСК ЭКСПЕРИМЕНТА С ГИПЕРПАРАМЕТРАМИ SVD")
+    print()
+    
+    for k in factors_list:
+        print(f"\nТестирование конфигурации: n_factors={k}")
+        model = SVDRecommender(n_factors=k, n_epochs=20, lr=0.005, reg=0.02)
+        model.fit(train_df)
+        
+        # Расчет метрик
+        metrics = calculate_all_metrics(model, test_df, train_df, user2idx, item2idx, idx2item, top_k=10)
+        
+        print(f"Результаты для k={k}:")
+        for name, value in metrics.items():
+            print(f"  {name}: {value:.4f}")
+            
+        metrics['n_factors'] = k
+        all_results.append(metrics)
+        
+    # Вывод сводной таблицы
+    results_df = pd.DataFrame(all_results)
+    print()
+    print("СВОДНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ")
+    print()
+    cols_to_show = ['n_factors', 'RMSE', 'MAE', 'Precision@K', 'Recall@K', 'HitRate@K', 'NDCG@K']
+    print(results_df[cols_to_show].to_string(index=False))
+    
+    # Находим лучшую конфигурацию по HitRate
+    if not results_df.empty:
+        best_idx = results_df['HitRate@K'].idxmax()
+        best_config = results_df.loc[best_idx]
+        best_k = int(best_config['n_factors'])
+        print(f"\nЛучшая конфигурация по HitRate@10: n_factors={best_k}")
+        
+        # Переобучаем лучшую модель для финальных рекомендаций
+        final_model = SVDRecommender(n_factors=best_k, n_epochs=20, lr=0.005, reg=0.02)
+        final_model.fit(train_df)
+        
+        # 4. Пример рекомендаций на лучшей модели
+        print("\nПример рекомендаций для пользователя")
+        sample_user_id = train_df['user_id'].iloc[0]
+        u_idx = user2idx[sample_user_id]
+        
+        seen_in_train = set(train_df[train_df['user_id'] == sample_user_id]['game_id'].values)
+        candidates = []
+        for i_idx in range(n_items):
+            game_id = idx2item[i_idx]
+            if game_id not in seen_in_train:
+                score = final_model.predict(u_idx, i_idx)
+                candidates.append((game_id, score))
+                
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top_5 = candidates[:5]
+        
+        print(f"Пользователь: {sample_user_id} (Model: SVD k={best_k})")
+        print(f"{'Rank':<5} | {'Game ID':<10} | {'Game Name':<40} | {'Score':<6}")
+        print("-" * 70)
+        for rank, (gid, score) in enumerate(top_5, 1):
+            gname = game_names.get(gid, "Unknown Game")
+            display_name = (gname[:37] + '...') if len(gname) > 40 else gname
+            print(f"{rank:<5} | {str(gid):<10} | {display_name:<40} | {score:.4f}")
+    else:
+        print("Не удалось получить результаты для сравнения.")
+
+if __name__ == "__main__":
+    main()
