@@ -1,1 +1,334 @@
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import re
+import string
+import warnings
+warnings.filterwarnings('ignore')
 
+# ==========================================================
+# 0. ЗАГРУЗКА И ПОДГОТОВКА ДАННЫХ
+# ==========================================================
+
+def load_and_prepare_content_data(filepath='steam_reco_with_descriptions.csv'):
+    """
+    Загружает данные и готовит контент ТОЛЬКО на основе названия и описания игры.
+    """
+    print("Загрузка данных...")
+    try:
+        df = pd.read_csv(filepath)
+    except Exception as e:
+        print(f"Ошибка загрузки: {e}")
+        return None
+
+    # Проверка наличия нужных колонок
+    required_cols = ['game_id', 'user_id', 'game_name', 'game_description']
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError(f"В датасете отсутствуют необходимые колонки. Найдены: {df.columns.tolist()}")
+        
+    # Нас интересуют только положительные взаимодействия (рекомендации)
+    if 'y_recommended' in df.columns:
+        df_pos = df[df['y_recommended'] == 1].copy()
+    else:
+        df_pos = df.copy() 
+        
+    if df_pos.empty:
+        raise ValueError("Нет положительных отзывов для анализа.")
+
+    # Очистка текста
+    def clean_text(text):
+        if pd.isna(text):
+            return ""
+        text = str(text).lower()
+        # Удаляем пунктуацию, оставляем буквы и цифры
+        text = re.sub(f'[{re.escape(string.punctuation)}]', '', text)
+        return text
+
+    # 1. Обработка названия игры (добавляем с большим весом)
+    df_pos['clean_name'] = df_pos['game_name'].apply(clean_text)
+    
+    # 2. Обработка описания игры
+    df_pos['clean_desc'] = df_pos['game_description'].apply(clean_text)
+    
+    # Создаем единый документ: Название (x3 для веса) + Описание
+    # Название важно, так как часто содержит жанр (например, "Euro Truck Simulator")
+    df_pos['content_doc'] = (
+        df_pos['clean_name'] + " " + 
+        df_pos['clean_name'] + " " + 
+        df_pos['clean_name'] + " " + 
+        df_pos['clean_desc']
+    )
+    
+    # Агрегация контента по играм
+    # Так как описание и название у одной игры одинаковые для всех пользователей,
+    # можно взять просто первое значение, но groupby обеспечит уникальность game_id
+    game_content = df_pos.groupby('game_id')['content_doc'].first().reset_index()
+    
+    # История взаимодействий для оценки
+    user_interactions = df_pos[['user_id', 'game_id']].copy()
+    
+    # Названия игр для вывода
+    game_names = df_pos.drop_duplicates(subset=['game_id'])[['game_id', 'game_name']].set_index('game_id')['game_name'].to_dict()
+
+    print(f"Подготовлено контента для {len(game_content)} игр.")
+    print(f"Всего взаимодействий: {len(user_interactions)}")
+    
+    return game_content, user_interactions, game_names
+
+# ==========================================================
+# 1. ВЕКТОРИЗАЦИЯ КОНТЕНТА (TF-IDF)
+# ==========================================================
+
+def build_tfidf_model(game_content_df, max_features=5000, ngram_range=(1, 2), min_df=1, max_df=0.95):
+    """
+    Строит TF-IDF матрицу для игр.
+    min_df=1, так как игр мало (около 350-400), и мы не хотим терять редкие слова.
+    """
+    tfidf = TfidfVectorizer(
+        stop_words='english',
+        max_features=max_features,
+        ngram_range=ngram_range,
+        min_df=min_df,
+        max_df=max_df,
+        dtype=np.float32
+    )
+    
+    tfidf_matrix = tfidf.fit_transform(game_content_df['content_doc'])
+    
+    game_ids = game_content_df['game_id'].values
+    game_idx_map = {gid: idx for idx, gid in enumerate(game_ids)}
+    
+    return tfidf_matrix, game_ids, game_idx_map
+
+# ==========================================================
+# 2. МОДЕЛЬ РЕКОМЕНДАЦИЙ
+# ==========================================================
+
+class ContentBasedRecommender:
+    def __init__(self, tfidf_matrix, game_ids, game_idx_map, train_history):
+        self.tfidf_matrix = tfidf_matrix
+        self.game_ids = game_ids
+        self.game_idx_map = game_idx_map
+        # Используем переданную историю обучения
+        self.user_history = train_history
+        
+    def get_recommendations(self, user_id, top_n=10):
+        if user_id not in self.user_history:
+            return []
+        
+        viewed_games = self.user_history[user_id]
+        
+        # Индексы просмотренных игр
+        history_indices = [self.game_idx_map[g] for g in viewed_games if g in self.game_idx_map]
+                
+        if not history_indices:
+            return []
+            
+        # Векторы просмотренных игр
+        history_vectors = self.tfidf_matrix[history_indices]
+        
+        # Профиль пользователя (средний вектор)
+        user_profile = np.array(history_vectors.mean(axis=0)).reshape(1, -1)
+        
+        # Сходство со всеми играми
+        scores = cosine_similarity(user_profile, self.tfidf_matrix).flatten()
+        
+        # Маскируем просмотренные
+        for game in viewed_games:
+            if game in self.game_idx_map:
+                scores[self.game_idx_map[game]] = -1
+                
+        # Топ-N
+        top_indices = np.argpartition(scores, -top_n)[-top_n:]
+        top_scores = scores[top_indices]
+        
+        sorted_order = np.argsort(top_scores)[::-1]
+        
+        recommendations = []
+        for idx in top_indices[sorted_order]:
+            if scores[idx] > 0:
+                recommendations.append((self.game_ids[idx], scores[idx]))
+                
+        return recommendations[:top_n]
+
+# ==========================================================
+# 3. МЕТРИКИ
+# ==========================================================
+
+def calculate_content_metrics(recommender, test_interactions, top_n=10):
+    hit_rates = []
+    precisions = []
+    recalls = []
+    ndcgs = []
+    
+    users_to_eval = list(test_interactions.keys())
+    
+    for user_id, ground_truth in test_interactions.items():
+        if not ground_truth:
+            continue
+            
+        recs = recommender.get_recommendations(user_id, top_n=top_n)
+        if not recs:
+            continue
+            
+        rec_items = set([item for item, score in recs])
+        
+        # В стратегии Leave-One-Out ground_truth обычно состоит из 1 элемента
+        hits_count = len(rec_items & ground_truth)
+        
+        # HitRate
+        hit_rates.append(1 if hits_count > 0 else 0)
+        
+        # Precision
+        precisions.append(hits_count / top_n)
+        
+        # Recall
+        recalls.append(hits_count / len(ground_truth) if len(ground_truth) > 0 else 0)
+        
+        # NDCG
+        dcg = 0.0
+        for rank, (item, _) in enumerate(recs):
+            if item in ground_truth:
+                dcg += 1.0 / np.log2(rank + 2)
+        
+        n_rel = min(len(ground_truth), top_n)
+        idcg = sum(1.0 / np.log2(i + 2) for i in range(n_rel))
+        ndcg = dcg / idcg if idcg > 0 else 0
+        ndcgs.append(ndcg)
+        
+    return {
+        'HitRate@K': np.mean(hit_rates) if hit_rates else 0,
+        'Precision@K': np.mean(precisions) if precisions else 0,
+        'Recall@K': np.mean(recalls) if recalls else 0,
+        'NDCG@K': np.mean(ndcgs) if ndcgs else 0
+    }
+
+# ==========================================================
+# 4. ГЛАВНЫЙ СКРИПТ
+# ==========================================================
+
+def main():
+    # 1. Загрузка (используем файл с описаниями)
+    data = load_and_prepare_content_data('steam_reco_with_descriptions.csv')
+    if data is None: return
+    
+    game_content, user_interactions, game_names = data
+    
+    # 2. Разбиение на Train/Test: Leave-One-Out
+    # Эта стратегия максимизирует размер теста.
+    # Для каждого пользователя берем ПОСЛЕДНЮЮ (или случайную) игру в тест, остальные в train.
+    import random
+    random.seed(42)
+    
+    train_history = {}
+    test_history = {}
+    
+    grouped = user_interactions.groupby('user_id')
+    for user, group in grouped:
+        items = group['game_id'].tolist()
+        
+        if len(items) == 1:
+            # Если всего 1 игра, кладем её в тест, а в train пустой набор
+            # (Модель CB не сможет дать рекомендации, но это честная оценка холодного старта)
+            train_history[user] = set()
+            test_history[user] = set(items)
+        else:
+            # Перемешиваем и берем 1 игру в тест
+            random.shuffle(items)
+            test_item = items[-1]
+            train_items = items[:-1]
+            
+            train_history[user] = set(train_items)
+            test_history[user] = {test_item}
+            
+    # Фильтруем пользователей с пустым тестом (хотя в LOO таких быть не должно, если есть хотя бы 1 игра)
+    test_history_filtered = {u: g for u, g in test_history.items() if len(g) > 0}
+    print(f"Пользователей в тесте (Leave-One-Out): {len(test_history_filtered)}")
+    
+    # 3. Эксперимент с гиперпараметрами
+    # Для небольших текстов (название + краткое описание) большие max_features могут быть шумными
+    param_grid = [
+        {'max_features': 2000, 'ngram_range': (1, 1)},
+        {'max_features': 5000, 'ngram_range': (1, 1)},
+        {'max_features': 5000, 'ngram_range': (1, 2)},
+    ]
+    
+    all_results = []
+    
+    print()
+    print("ЗАПУСК ЭКСПЕРИМЕНТА С ГИПЕРПАРАМЕТРАМИ (Content-Based: Name + Desc)")
+    print()
+    
+    for params in param_grid:
+        mf = params['max_features']
+        ng = params['ngram_range']
+        print(f"\nТестирование: max_features={mf}, ngram_range={ng}")
+        
+        # Построение модели
+        tfidf_matrix, game_ids, game_idx_map = build_tfidf_model(
+            game_content, 
+            max_features=mf, 
+            ngram_range=ng,
+            min_df=1 # Снижаем порог, так как игр мало
+        )
+        
+        # Инициализация рекомендателя
+        rec_sys = ContentBasedRecommender(tfidf_matrix, game_ids, game_idx_map, train_history)
+        
+        # Оценка
+        metrics = calculate_content_metrics(rec_sys, test_history_filtered, top_n=10)
+        
+        print(f"  HR@10: {metrics['HitRate@K']:.4f}, P@10: {metrics['Precision@K']:.4f}, NDCG@10: {metrics['NDCG@K']:.4f}")
+        
+        metrics['max_features'] = mf
+        metrics['ngram_range'] = str(ng)
+        all_results.append(metrics)
+        
+    # Вывод таблицы
+    results_df = pd.DataFrame(all_results)
+    print()
+    print("СВОДНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ")
+    print()
+    cols = ['max_features', 'ngram_range', 'HitRate@K', 'Precision@K', 'Recall@K', 'NDCG@K']
+    print(results_df[cols].to_string(index=False))
+    
+    # Лучшая модель по HitRate
+    best_idx = results_df['HitRate@K'].idxmax()
+    best_params = results_df.loc[best_idx]
+    print(f"\nЛучшая конфигурация по HitRate@10: {best_params[['max_features', 'ngram_range']].to_dict()}")
+    
+    # 4. Пример рекомендаций на лучшей модели
+    best_mf = int(best_params['max_features'])
+    best_ng = eval(best_params['ngram_range']) 
+    
+    tfidf_matrix_best, game_ids_best, game_idx_map_best = build_tfidf_model(
+        game_content, max_features=best_mf, ngram_range=best_ng, min_df=1
+    )
+    final_rec_sys = ContentBasedRecommender(tfidf_matrix_best, game_ids_best, game_idx_map_best, train_history)
+    
+    print("\nПример рекомендаций (Best Model)")
+    
+    # Найдем пользователя, у которого есть история в train, чтобы показать рекомендации
+    sample_user = None
+    for u, history in train_history.items():
+        if len(history) > 0:
+            sample_user = u
+            break
+            
+    if sample_user:
+        recs = final_rec_sys.get_recommendations(sample_user, top_n=5)
+        
+        print(f"Пользователь: {sample_user}")
+        print(f"Его история в Train: {[game_names.get(gid, 'Unknown') for gid in list(train_history[sample_user])[:3]]}...")
+        print(f"{'Rank':<5} | {'Game ID':<10} | {'Game Name':<40} | {'Score':<6}")
+        print("-" * 70)
+        for rank, (gid, score) in enumerate(recs, 1):
+            gname = game_names.get(gid, "Unknown Game")
+            display_name = (gname[:37] + '...') if len(gname) > 40 else gname
+            print(f"{rank:<5} | {str(gid):<10} | {display_name:<40} | {score:.4f}")
+    else:
+        print("Не удалось найти пользователя с историей для демонстрации.")
+
+if __name__ == "__main__":
+    main()
