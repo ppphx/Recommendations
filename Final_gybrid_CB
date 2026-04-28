@@ -1,1 +1,465 @@
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import csr_matrix
+import re
+import string
+import warnings
+warnings.filterwarnings('ignore')
 
+# 0. Загрузка и подготовка данных
+
+def load_and_prepare_hybrid_data(filepath='steam_reco_with_descriptions.csv'):
+    """
+    Загружает данные для гибридной модели.
+    Требует файл с описанием игр для CB части и взаимодействия для KNN части.
+    """
+    print("Загрузка данных")
+    try:
+        df = pd.read_csv(filepath)
+    except Exception as e:
+        print(f"Ошибка загрузки: {e}")
+        return None
+
+    required_cols = ['user_id', 'game_id', 'y_recommended', 'game_name', 'game_description']
+    if not all(col in df.columns for col in required_cols):
+        raise ValueError(f"Отсутствуют необходимые колонки. Найдены: {df.columns.tolist()}")
+        
+    # Фильтр положительных взаимодействий
+    df_pos = df[df['y_recommended'] == 1].copy()
+    if df_pos.empty:
+        raise ValueError("Нет положительных отзывов.")
+
+    # Подготовка для Content-Based (Название + Описание)
+    def clean_text(text):
+        if pd.isna(text): return ""
+        return re.sub(f'[{re.escape(string.punctuation)}]', '', str(text).lower())
+
+    df_pos['clean_name'] = df_pos['game_name'].apply(clean_text)
+    df_pos['clean_desc'] = df_pos['game_description'].apply(clean_text)
+    
+    # Название x3 + Описание (для усиления веса названия в тексте)
+    df_pos['content_doc'] = (
+        df_pos['clean_name'] + " " + 
+        df_pos['clean_name'] + " " + 
+        df_pos['clean_name'] + " " + 
+        df_pos['clean_desc']
+    )
+    
+    game_content = df_pos.groupby('game_id')['content_doc'].first().reset_index()
+    
+    # Подготовка для KNN (Маппинги и Матрица)
+    users = df_pos['user_id'].unique()
+    items = df_pos['game_id'].unique()
+    
+    user2idx = {u: i for i, u in enumerate(users)}
+    item2idx = {it: i for i, it in enumerate(items)}
+    idx2item = {i: it for it, i in item2idx.items()}
+    game_names = dict(zip(df_pos['game_id'], df_pos['game_name']))
+    
+    df_pos['u_idx'] = df_pos['user_id'].map(user2idx)
+    df_pos['i_idx'] = df_pos['game_id'].map(item2idx)
+    
+    n_users = len(users)
+    n_items = len(items)
+    
+    # Матрица взаимодействий для KNN (бинарная)
+    R = csr_matrix((np.ones(len(df_pos)), (df_pos['u_idx'].values, df_pos['i_idx'].values)), 
+                   shape=(n_users, n_items))
+    
+    print(f"Игр с контентом: {len(game_content)}, Пользователей: {n_users}")
+    
+    return (game_content, user2idx, item2idx, idx2item, game_names, 
+            n_users, n_items, R, df_pos)
+
+# 1. Модель 1: Content-based (для отбора кандидатов и скоринга)
+
+class ContentBasedRetriever:
+    def __init__(self, game_content_df, item2idx, idx2item):
+        self.item2idx = item2idx
+        self.idx2item = idx2item
+        
+        # TF-IDF векторизация
+        tfidf = TfidfVectorizer(stop_words='english', max_features=5000, ngram_range=(1, 2))
+        self.tfidf_matrix = tfidf.fit_transform(game_content_df['content_doc'])
+        self.game_ids = game_content_df['game_id'].values
+        self.gid_to_tidx = {gid: idx for idx, gid in enumerate(self.game_ids)}
+        
+    def get_candidate_indices(self, user_liked_game_ids, top_n=100):
+        """
+        Возвращает индексы игр-кандидатов в глобальной системе координат (item2idx).
+        Увеличили top_n до 100 для снижения риска отсечения.
+        """
+        indices = [self.gid_to_tidx[gid] for gid in user_liked_game_ids if gid in self.gid_to_tidx]
+        if not indices:
+            return []
+            
+        vecs = self.tfidf_matrix[indices]
+        profile = np.array(vecs.mean(axis=0)).reshape(1, -1)
+        
+        scores = cosine_similarity(profile, self.tfidf_matrix).flatten()
+        
+        # Топ-N кандидатов из TF-IDF пространства
+        top_tfidf_indices = np.argpartition(scores, -top_n)[-top_n:]
+        
+        # Переводим индексы из TF-IDF матрицы в глобальные индексы игр
+        candidate_global_indices = []
+        for t_idx in top_tfidf_indices:
+            gid = self.game_ids[t_idx]
+            if gid in self.item2idx:
+                candidate_global_indices.append(self.item2idx[gid])
+                
+        return candidate_global_indices
+
+    def get_cb_scores_for_candidates(self, user_liked_game_ids, candidate_global_indices):
+        """
+        Вычисляет косинусное сходство (CB скоры) для конкретного списка кандидатов.
+        Возвращает словарь {global_idx: score}
+        """
+        indices_liked = [self.gid_to_tidx[gid] for gid in user_liked_game_ids if gid in self.gid_to_tidx]
+        if not indices_liked or not candidate_global_indices:
+            return {}
+            
+        # Профиль пользователя
+        vecs = self.tfidf_matrix[indices_liked]
+        profile = np.array(vecs.mean(axis=0)).reshape(1, -1)
+        
+        # Векторы кандидатов
+        cand_tfidf_indices = []
+        valid_global_indices = []
+        for g_idx in candidate_global_indices:
+            gid = self.idx2item[g_idx]
+            if gid in self.gid_to_tidx:
+                cand_tfidf_indices.append(self.gid_to_tidx[gid])
+                valid_global_indices.append(g_idx)
+                
+        if not cand_tfidf_indices:
+            return {}
+            
+        cand_vecs = self.tfidf_matrix[cand_tfidf_indices]
+        scores = cosine_similarity(profile, cand_vecs).flatten()
+        
+        return {g_idx: score for g_idx, score in zip(valid_global_indices, scores)}
+
+# 2. Модель 2: Hybrid KNN (для ранжирования кандидатов)
+
+class HybridKNNRanker:
+    def __init__(self, R, n_items, k=30, alpha=0.3):
+        self.R = R
+        self.n_items = n_items
+        self.k = k
+        self.alpha = alpha
+        
+        # Means & Popularity
+        sums = np.array(R.sum(axis=1)).flatten()
+        R_bin = csr_matrix((np.ones(R.nnz), R.indices, R.indptr), shape=R.shape)
+        counts = np.array(R_bin.sum(axis=1)).flatten()
+        counts[counts==0] = 1
+        self.means = sums / counts
+        
+        # Popularity Score (Global) для небольшого буста
+        item_popularity = np.array(R.sum(axis=0)).flatten()
+        max_pop = np.max(item_popularity) if np.max(item_popularity) > 0 else 1
+        self.norm_pop = item_popularity / max_pop
+        
+        # Similarities
+        R_dense = R.toarray()
+        R_cent = R_dense - self.means.reshape(-1, 1)
+        R_cent = R_cent * R_bin.toarray()
+        self.user_sim = cosine_similarity(R_cent)
+        np.fill_diagonal(self.user_sim, 0)
+        
+        self.item_sim = cosine_similarity(R.T)
+        np.fill_diagonal(self.item_sim, 0)
+        
+    def rank_candidates(self, u_idx, candidate_indices, cb_scores_dict=None, cb_weight=0.4):
+        """
+        Считает скоры User+Item Based + CB Boost + Popularity Boost
+        """
+        if not candidate_indices:
+            return []
+            
+        candidate_arr = np.array(candidate_indices)
+        
+        # 1. User-Based Score
+        sims_u = self.user_sim[u_idx]
+        neighbors = np.argpartition(sims_u, -self.k)[-self.k:]
+        sims_n = sims_u[neighbors]
+        mask = sims_n > 0.01
+        neighbors, sims_n = neighbors[mask], sims_n[mask]
+        
+        score_u_cand = np.zeros(len(candidate_arr))
+        if len(neighbors) > 0:
+            rat_neigh = self.R[neighbors][:, candidate_arr].toarray()
+            means_neigh = self.means[neighbors]
+            diffs = rat_neigh - means_neigh.reshape(-1, 1)
+            w_sum = np.abs(sims_n).dot(np.ones_like(diffs))
+            w_sum[w_sum<1e-9] = 1e-9
+            pred_diffs = sims_n.dot(diffs) / w_sum
+            score_u_cand = self.means[u_idx] + pred_diffs
+            
+        # 2. Item-Based Score
+        viewed = self.R[u_idx].nonzero()[1]
+        score_i_cand = np.zeros(len(candidate_arr))
+        w_i_cand = np.zeros(len(candidate_arr))
+        
+        if len(viewed) > 0:
+            for i_idx in viewed:
+                sims = self.item_sim[i_idx][candidate_arr]
+                v_mask = sims > 0.01
+                if np.any(v_mask):
+                    score_i_cand[v_mask] += sims[v_mask]
+                    w_i_cand[v_mask] += np.abs(sims[v_mask])
+                    
+        w_i_cand[w_i_cand<1e-9] = 1e-9
+        score_i_cand = score_i_cand / w_i_cand
+        
+        # 3. Hybrid KNN Combination
+        def norm(arr):
+            if np.max(arr) == np.min(arr): return np.zeros_like(arr)
+            return (arr - np.min(arr)) / (np.max(arr) - np.min(arr))
+            
+        knn_score = self.alpha * norm(score_u_cand) + (1 - self.alpha) * norm(score_i_cand)
+        
+        # 4. Incorporate CB Scores (If provided)
+        final_scores = knn_score.copy()
+        if cb_scores_dict:
+            cb_vals = np.array([cb_scores_dict.get(idx, 0.0) for idx in candidate_arr])
+            if np.max(cb_vals) > 0:
+                cb_norm = norm(cb_vals)
+                # Вес CB в финальном ранжировании передается как аргумент
+                final_scores = (1 - cb_weight) * knn_score + cb_weight * cb_norm
+                
+        # 5. Popularity Boost (Small bonus for popular items)
+        pop_bonus = self.norm_pop[candidate_arr] * 0.05 
+        final_scores += pop_bonus
+        
+        return list(zip(candidate_arr, final_scores))
+
+# 3. Каскадная гибридная система
+
+class CascadeHybridRecommender:
+    def __init__(self, cb_retriever, knn_ranker, user2idx, idx2item, game_names, train_history):
+        self.cb = cb_retriever
+        self.knn = knn_ranker
+        self.user2idx = user2idx
+        self.idx2item = idx2item
+        self.game_names = game_names
+        self.train_history = train_history
+        
+    def get_recommendations(self, user_id, top_n=10, candidate_pool_size=100, cb_weight=0.4):
+        if user_id not in self.user2idx or user_id not in self.train_history:
+            return []
+            
+        u_idx = self.user2idx[user_id]
+        liked_games = self.train_history[user_id]
+        
+        if len(liked_games) == 0:
+            return []
+            
+        # Этап 1: Retrieval (Content-Based)
+        # Получаем кандидатов (размер пула варьируется)
+        candidate_indices = self.cb.get_candidate_indices(liked_games, top_n=candidate_pool_size)
+        
+        if not candidate_indices:
+            return []
+            
+        # Получаем CB скоры для этих кандидатов для последующего смешивания
+        cb_scores_dict = self.cb.get_cb_scores_for_candidates(liked_games, candidate_indices)
+
+        # Этап 2: Ranking (Hybrid KNN + CB Blend)
+        ranked_list = self.knn.rank_candidates(u_idx, candidate_indices, cb_scores_dict, cb_weight)
+        
+        # Сортировка по убыванию скора
+        ranked_list.sort(key=lambda x: x[1], reverse=True)
+        
+        # Маскируем просмотренные и формируем ответ
+        final_recs = []
+        for idx, score in ranked_list:
+            gid = self.idx2item[idx]
+            if gid not in liked_games and score > 0:
+                gname = self.game_names.get(gid, "Unknown")
+                final_recs.append((gid, gname, score))
+                
+        return final_recs[:top_n]
+
+# 4. Метрики
+
+def calculate_metrics(recommender, test_history, train_history, top_n=10, candidate_pool_size=100, cb_weight=0.4):
+    hit_rates, precisions, recalls, ndcgs = [], [], [], []
+    rmse_errors, mae_errors = [], []
+    
+    for uid, gt_items in test_history.items():
+        if not gt_items: continue
+        
+        # Передаем гиперпараметры в метод рекомендаций
+        recs = recommender.get_recommendations(uid, top_n=top_n, 
+                                               candidate_pool_size=candidate_pool_size, 
+                                               cb_weight=cb_weight)
+        if not recs: continue
+        
+        rec_ids = [r[0] for r in recs]
+        rec_scores = [r[2] for r in recs] # Используем скор модели как предсказанный рейтинг
+        rec_set = set(rec_ids)
+        
+        hits = len(rec_set & gt_items)
+        
+        # HitRate
+        hit_rates.append(1 if hits > 0 else 0)
+        
+        # Precision
+        precisions.append(hits / top_n)
+        
+        # Recall
+        if len(gt_items) > 0:
+            recalls.append(hits / len(gt_items))
+        else:
+            recalls.append(0)
+        
+        # NDCG
+        dcg = sum(1.0/np.log2(rank+2) for rank, gid in enumerate(rec_ids) if gid in gt_items)
+        n_rel = min(len(gt_items), top_n)
+        idcg = sum(1.0/np.log2(i+2) for i in range(n_rel))
+        ndcgs.append(dcg/idcg if idcg>0 else 0)
+        
+        for i, gid in enumerate(rec_ids):
+            if gid in gt_items:
+                true_rating = 1.0 # В данном контексте тестовые данные - это положительные взаимодействия
+                pred_rating = rec_scores[i]
+                # Ограничиваем предсказание диапазоном [0, 1] для корректного сравнения с бинарной целью
+                pred_rating_clipped = np.clip(pred_rating, 0, 1)
+                
+                rmse_errors.append((true_rating - pred_rating_clipped) ** 2)
+                mae_errors.append(abs(true_rating - pred_rating_clipped))
+                
+    return {
+        'HitRate@K': np.mean(hit_rates) if hit_rates else 0,
+        'Precision@K': np.mean(precisions) if precisions else 0,
+        'Recall@K': np.mean(recalls) if recalls else 0,
+        'NDCG@K': np.mean(ndcgs) if ndcgs else 0,
+        'RMSE': np.sqrt(np.mean(rmse_errors)) if rmse_errors else 0,
+        'MAE': np.mean(mae_errors) if mae_errors else 0
+    }
+
+# 5. Мэйн
+
+def main():
+    # 1. Data
+    data = load_and_prepare_hybrid_data('steam_reco_with_descriptions.csv')
+    if data is None: return
+    
+    (game_content, user2idx, item2idx, idx2item, game_names, 
+     n_users, n_items, R, df_pos) = data
+    
+    # 2. Split
+    import random
+    random.seed(42)
+    
+    train_history = {}
+    test_history = {}
+    
+    grouped = df_pos.groupby('user_id')
+    for user, group in grouped:
+        items = group['game_id'].tolist()
+        if len(items) == 1:
+            train_history[user] = set()
+            test_history[user] = set(items)
+        else:
+            random.shuffle(items)
+            test_item = items[-1]
+            train_items = items[:-1]
+            train_history[user] = set(train_items)
+            test_history[user] = {test_item}
+            
+    test_history_filtered = {u: g for u, g in test_history.items() if len(g) > 0}
+    print(f"Пользователей в тесте: {len(test_history_filtered)}")
+    
+    # 3. Обучаем базовые модели)
+    print("\nОбучение Content-Based Retriever")
+    cb_retriever = ContentBasedRetriever(game_content, item2idx, idx2item)
+    
+    print("Обучение Hybrid KNN Ranker")
+    # Базовые параметры KNN
+    knn_ranker = HybridKNNRanker(R, n_items, k=30, alpha=0.3)
+    
+    # 4. Init Recommender
+    final_rec = CascadeHybridRecommender(cb_retriever, knn_ranker, user2idx, idx2item, game_names, train_history)
+    
+    # 5. Hyperparameter Tuning
+    print("Запуск подбора гиперпараметров")
+    
+    # Варьируем вес CB и размер пула кандидатов
+    cb_weights = [0.2, 0.4, 0.6] 
+    pool_sizes = [50, 100, 150]
+    
+    results = []
+    
+    for cw in cb_weights:
+        for ps in pool_sizes:
+            print(f"\nТестирование: CB Weight={cw}, Pool Size={ps}")
+            # Передаем train_history для расчета RMSE/MAE (если нужно будет сравнивать с чем-то еще)
+            # Но в данном случае RMSE считается по тестовым попаданиям
+            metrics = calculate_metrics(final_rec, test_history_filtered, train_history, top_n=10, 
+                                        candidate_pool_size=ps, cb_weight=cw)
+            
+            print(f"  HR@10: {metrics['HitRate@K']:.4f}, P@10: {metrics['Precision@K']:.4f}, RMSE: {metrics['RMSE']:.4f}")
+            
+            res = metrics.copy()
+            res['cb_weight'] = cw
+            res['pool_size'] = ps
+            results.append(res)
+            
+    # Вывод таблицы результатов
+    results_df = pd.DataFrame(results)
+    print("СВОДНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ")
+    cols = ['cb_weight', 'pool_size', 'HitRate@K', 'Precision@K', 'Recall@K', 'NDCG@K', 'RMSE', 'MAE']
+    print(results_df[cols].to_string(index=False))
+    
+    # Находим лучшую конфигурацию по HitRate
+    best_idx = results_df['HitRate@K'].idxmax()
+    best_config = results_df.loc[best_idx]
+    best_cw = best_config['cb_weight']
+    best_ps = int(best_config['pool_size'])
+    
+    print(f"\nЛучшая конфигурация по HitRate@10: CB Weight={best_cw}, Pool Size={best_ps}")
+    
+    # 6. Оценка на лучших параметрах
+    print("\nФинальная оценка на лучших параметрах")
+    final_metrics = calculate_metrics(final_rec, test_history_filtered, train_history, top_n=10, 
+                                      candidate_pool_size=best_ps, cb_weight=best_cw)
+    
+    print("\nРезультаты итоговой системы")
+    print(f"HitRate@10: {final_metrics['HitRate@K']:.4f}")
+    print(f"Precision@10: {final_metrics['Precision@K']:.4f}")
+    print(f"Recall@10:    {final_metrics['Recall@K']:.4f}")
+    print(f"NDCG@10:      {final_metrics['NDCG@K']:.4f}")
+    print(f"RMSE:         {final_metrics['RMSE']:.4f}")
+    print(f"MAE:          {final_metrics['MAE']:.4f}")
+    
+    print("\nСравнительная таблица")
+    print("Model          | HR@10  | P@10   | NDCG@10 | RMSE   ")
+    print("---------------|--------|--------|---------|--------")
+    print("SVD            | 0.0695 | 0.0069 | 0.0297  | 0.3258 ")
+    print("Content-Based  | 0.1740 | 0.0174 | 0.1740  | -      ")
+    print("Hybrid KNN     | 0.1781 | 0.0178 | 0.0948  | 0.3015 ")
+    print(f"Cascade Hyb  | {final_metrics['HitRate@K']:.4f} | {final_metrics['Precision@K']:.4f} | {final_metrics['NDCG@K']:.4f} | {final_metrics['RMSE']:.4f}")
+    
+    # 7. Пример рекомендаций
+    sample_user = None
+    for u, hist in train_history.items():
+        if len(hist) > 0:
+            sample_user = u
+            break
+            
+    if sample_user:
+        recs = final_rec.get_recommendations(sample_user, top_n=5, 
+                                             candidate_pool_size=best_ps, 
+                                             cb_weight=best_cw)
+        print(f"\nРекомендации для {sample_user}:")
+        print(f"История: {[game_names.get(g, '?') for g in list(train_history[sample_user])[:3]]}")
+        for rank, (gid, gname, score) in enumerate(recs, 1):
+            print(f"{rank}. {gname} (Score: {score:.3f})")
+
+if __name__ == "__main__":
+    main()
